@@ -256,14 +256,83 @@ bounded rather than unbounded, but still substantial per worker -- check
 `free -h` against `--workers N` × ~550MB before pointing it at a large
 range on a memory-constrained machine.
 
-## Stage 4 — Checkpointing & resumability
+## Stage 4 — Checkpointing & resumability — DONE (found and fixed three real bugs along the way)
 
-Since this is being built (and run) across multiple sessions/token budgets:
+Implemented as `--checkpoint DIR`. A run is modeled as N independent
+"lanes" over `a` values -- 1 lane for the single-process search, `workers`
+lanes (round-robin, per Stage 3) for `--workers` -- each persisting the
+last `a` it fully finished to its own small file (`lane_N.txt`), so
+workers never contend writing the same file. `meta.json` records the
+range/`--prune`/`--perfect-only`/`--workers` a checkpoint was created
+with; resuming with different settings is refused (not silently run) --
+those change what a lane's stride even means, so trusting a mismatched
+checkpoint could silently produce wrong or incomplete results. Refactored
+`search_bricks` into a new `_bricks_for_a(a, ...)` so checkpointing can
+observe progress per `a`, not per brick *found* -- most `a` values yield
+zero bricks, so checkpointing only on a find would leave the checkpoint
+stale for long, unpredictable stretches.
 
-- Durable checkpoint (SQLite or JSON) recording the highest `a` fully
-  searched per shard, so a run can stop and resume without restarting from 1.
-- Results log stays append-only CSV (already have this from Stage 0) so
-  partial progress is never lost.
+None of the following was caught by reasoning about the code. All three
+were caught by actually simulating an interruption and checking the
+result against an uninterrupted baseline -- `check_checkpoint.py` now
+does this automatically (interrupt a real run with SIGTERM partway
+through, resume it, diff against a clean run), and exists specifically so
+a future change to this code gets re-checked against a real scenario
+again, not just re-reasoned about:
+
+1. **Duplicate rows.** Checkpoints save every `CHECKPOINT_INTERVAL` (1000)
+   `a` values, not every single one, so an interruption between saves
+   means the resumed run re-searches -- and was re-logging -- whatever
+   `a` values the interrupted run had already processed past the last
+   save point. First reproduction: 60 duplicate rows out of 5,327 after
+   an interrupt/resume cycle on `1-300,000`. Fixed with `_logged_keys`, a
+   set of `(a, b, c)` loaded from the existing log at resume time, checked
+   before every write, in both `log_result` (single-process) and
+   `_worker_search` (parallel).
+
+2. **Missing rows.** `_worker_search` keeps its log file handle open and
+   buffered for the entire worker process, unlike the single-process
+   path's `log_result`, which opens/writes/closes per row. A checkpoint
+   save is reliably flushed (via a `with open(...)` block), but nothing
+   was forcing the *log* to be flushed before that checkpoint save
+   claimed a range was done -- so a hard kill could lose buffered log
+   rows for `a` values the checkpoint already said were durably
+   complete. Second reproduction: 58 bricks silently missing (0 extra)
+   after an interrupt/resume cycle at `--workers 4`. Fixed by calling
+   `log_fh.flush()` immediately before every `save_lane_progress()` call,
+   so "checkpoint says done" can never outrun "log is actually on disk."
+
+3. **Orphaned worker processes.** `multiprocessing.Pool`'s workers are
+   daemonic, normally cleaned up via the parent's `atexit` handling when
+   it exits normally -- but a fatal signal (SIGTERM from `kill`, the
+   `timeout` shell command's default, Ctrl+C's underlying SIGINT already
+   worked since Python turns that into a catchable `KeyboardInterrupt`)
+   terminates the parent immediately, bypassing `atexit` and
+   `Pool.__exit__` entirely. The orphaned workers kept running
+   independently and could race a subsequent `--checkpoint` resume.
+   Reproduction required *not* using `subprocess.run(timeout=...)` in the
+   test script, which calls `Popen.kill()` -> SIGKILL, uncatchable by any
+   userspace code -- switched to `Popen.terminate()` (SIGTERM) to
+   simulate what a real interruption looks like. Fixed by installing a
+   SIGTERM handler (only in the parent, added *after* the Pool has
+   already forked its workers, so they don't inherit it) that converts
+   the signal into a Python exception, letting it unwind normally through
+   `with multiprocessing.Pool(...)`, whose `__exit__` calls
+   `terminate()`+`join()` on every worker. A true SIGKILL or power loss
+   can still orphan workers -- nothing running inside the killed process
+   can prevent that -- but that's a fundamentally different, unsolvable
+   problem from the one this fixes, and is called out here rather than
+   silently left as a gap.
+
+Verified end to end for both the single-process and `--workers 4` paths:
+interrupt via real SIGTERM partway through a `1-300,000` run, confirm no
+orphaned processes, resume, and diff against an uninterrupted baseline --
+exact match, 0 duplicates, 0 missing, in both cases. Also verified: the
+settings-mismatch guard refuses to resume a checkpoint created with
+different flags (clear error, exit code 1); an already-complete
+checkpoint re-run is a no-op that doesn't touch the log file (confirmed
+via unchanged md5sum) rather than silently truncating a finished result
+set while rebuilding it from an empty merge.
 
 ## Stage 5 — Reality check
 

@@ -15,13 +15,34 @@ Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 """
 import argparse
 import csv
+import json
 import math
 import multiprocessing
 import os
+import signal
 import sys
 from functools import lru_cache
 
 LEARNING_MODES = {"l", "learn", "learning"}
+CHECKPOINT_INTERVAL = 1000  # persist progress every this many `a` values processed
+
+
+class _Interrupted(Exception):
+    """Raised by the SIGTERM handler installed in generate_bricks_parallel.
+
+    SIGTERM's default action terminates the process immediately without
+    running Python cleanup code -- including multiprocessing.Pool's
+    __exit__, which is what calls pool.terminate() on its worker
+    processes. Without this, a hard kill (`timeout`, `kill`, a container
+    orchestrator's stop signal) leaves the Pool's worker subprocesses
+    orphaned and still running (they're daemonic, so they'd normally be
+    cleaned up via the parent's atexit handling, but a fatal signal
+    bypasses atexit entirely). An orphaned worker can then race a
+    subsequent --checkpoint resume, corrupting its output -- caught via
+    check_checkpoint.py, not by reasoning about the code. Converting
+    SIGTERM into a raised exception lets it unwind through the `with
+    multiprocessing.Pool(...)` block normally, so __exit__ still runs.
+    """
 
 
 def _prime_factors(n):
@@ -179,6 +200,44 @@ def perfect_only_requirements(a, b):
     return required_mod, required_odd
 
 
+def _bricks_for_a(a, range_end, prune, perfect_only):
+    """Yields (a, b, c, d, e, f) Euler-brick tuples for this single a.
+
+    Factored out from search_bricks (below) so Stage 4's checkpointing can
+    drive its own `for a in ...` loop and persist progress after each `a`
+    completes -- most `a` values yield zero bricks, so checkpointing only
+    when a brick is *found* would leave checkpoints stale for long,
+    unpredictable stretches. This is the same algorithm as before the
+    refactor, just callable one `a` at a time.
+    """
+    partners_a = [(v, diag) for (v, diag) in pythagorean_partners(a) if a < v < range_end]
+    if not partners_a:
+        return
+    a_diag_for = dict(partners_a)
+    for b, d in partners_a:
+        required_odd = False
+        if perfect_only:
+            req = perfect_only_requirements(a, b)
+            if req is None:
+                continue
+            required_mod, required_odd = req
+        elif prune:
+            required_mod = required_modulus_for_third_edge(a, b)
+        else:
+            required_mod = 1
+        for c, f in pythagorean_partners(b):
+            if c <= b or c >= range_end:
+                continue
+            if required_mod != 1 and c % required_mod != 0:
+                continue
+            if required_odd and c % 2 == 0:
+                continue
+            e = a_diag_for.get(c)
+            if e is None:
+                continue
+            yield (a, b, c, d, e, f)
+
+
 def search_bricks(a_values, range_end, prune, perfect_only=False):
     """Yields (a, b, c, d, e, f) Euler-brick tuples for each a in a_values,
     checked against the shared range_end bound (b, c < range_end).
@@ -204,67 +263,181 @@ def search_bricks(a_values, range_end, prune, perfect_only=False):
     logging when perfect_only is set).
     """
     for a in a_values:
-        partners_a = [(v, diag) for (v, diag) in pythagorean_partners(a) if a < v < range_end]
-        if not partners_a:
-            continue
-        a_diag_for = dict(partners_a)
-        for b, d in partners_a:
-            required_odd = False
-            if perfect_only:
-                req = perfect_only_requirements(a, b)
-                if req is None:
-                    continue
-                required_mod, required_odd = req
-            elif prune:
-                required_mod = required_modulus_for_third_edge(a, b)
-            else:
-                required_mod = 1
-            for c, f in pythagorean_partners(b):
-                if c <= b or c >= range_end:
-                    continue
-                if required_mod != 1 and c % required_mod != 0:
-                    continue
-                if required_odd and c % 2 == 0:
-                    continue
-                e = a_diag_for.get(c)
-                if e is None:
-                    continue
-                yield (a, b, c, d, e, f)
+        yield from _bricks_for_a(a, range_end, prune, perfect_only)
+
+
+# Stage 4 (ROADMAP.md): checkpoint/resume, so a long unattended search can
+# be stopped and picked back up instead of restarting from the beginning
+# of the range. A run is modeled as N independent "lanes" over `a` values:
+# 1 lane (stride 1) for the single-process search, `workers` lanes (each
+# stride `workers`, round-robin per Stage 3) for --workers. Each lane
+# tracks the last `a` it fully finished in its own small file, so workers
+# never contend writing the same file. `meta.json` records the settings a
+# checkpoint was created with; resuming with different settings (a
+# different range, prune/perfect_only, or a different worker count, which
+# would change what each lane's stride even means) is refused rather than
+# silently producing wrong or incomplete results.
+def _checkpoint_meta_path(checkpoint_dir):
+    return os.path.join(checkpoint_dir, "meta.json")
+
+
+def _checkpoint_lane_path(checkpoint_dir, lane_id):
+    return os.path.join(checkpoint_dir, "lane_{}.txt".format(lane_id))
+
+
+def checkpoint_settings(a_start, a_end, prune, perfect_only, workers):
+    return {
+        "a_start": a_start, "a_end": a_end,
+        "prune": bool(prune), "perfect_only": bool(perfect_only),
+        "workers": workers,
+    }
+
+
+def load_or_init_checkpoint(checkpoint_dir, settings, num_lanes):
+    """Returns a list of `num_lanes` resume points: the next `a` each lane
+    should process (a_start + lane_id for a fresh lane, or the lane's last
+    completed `a` plus its stride if resuming). Creates the checkpoint dir
+    and meta.json on first use; on a later run, validates meta.json
+    matches `settings` exactly before trusting any lane files found there.
+    """
+    meta_path = _checkpoint_meta_path(checkpoint_dir)
+    stride = settings["workers"]
+    a_start = settings["a_start"]
+    if os.path.exists(checkpoint_dir):
+        if not os.path.exists(meta_path):
+            sys.exit("[Error] Checkpoint dir '{}' exists but has no meta.json -- "
+                      "refusing to guess whether it's safe to reuse. Remove it or "
+                      "pick a different --checkpoint path.".format(checkpoint_dir))
+        with open(meta_path) as fh:
+            saved = json.load(fh)
+        if saved != settings:
+            sys.exit("[Error] Checkpoint at '{}' was created with different settings.\n"
+                      "  saved:   {}\n  this run: {}\n"
+                      "Remove the checkpoint, or match the original --range/--prune/"
+                      "--perfect-only/--workers to resume.".format(checkpoint_dir, saved, settings))
+        print("[Info] Resuming from checkpoint at '{}'...\n".format(checkpoint_dir))
+    else:
+        os.makedirs(checkpoint_dir)
+        with open(meta_path, "w") as fh:
+            json.dump(settings, fh)
+
+    resume_points = []
+    for lane_id in range(num_lanes):
+        lane_path = _checkpoint_lane_path(checkpoint_dir, lane_id)
+        if os.path.exists(lane_path):
+            with open(lane_path) as fh:
+                last_done = int(fh.read().strip())
+            resume_points.append(last_done + stride)
+        else:
+            resume_points.append(a_start + lane_id)
+    return resume_points
+
+
+def load_logged_keys(log_file):
+    """Returns the set of (a, b, c) already present in log_file (empty set
+    if it doesn't exist yet). Used to dedupe a checkpointed run's redo
+    window: checkpoints save every CHECKPOINT_INTERVAL `a` values, not
+    every single one, so an interruption between saves means the next
+    resume re-searches (and, without this, would re-log) whatever `a`
+    values were already processed-and-logged past the last save point.
+    """
+    keys = set()
+    if not log_file or not os.path.exists(log_file):
+        return keys
+    with open(log_file, newline="") as fh:
+        reader = csv.reader(fh)
+        next(reader, None)  # header
+        for row in reader:
+            if len(row) >= 3:
+                keys.add((int(row[0]), int(row[1]), int(row[2])))
+    return keys
+
+
+def save_lane_progress(checkpoint_dir, lane_id, last_a):
+    # Write to a temp file then rename: an interruption mid-write (e.g. the
+    # process killed at exactly the wrong moment) leaves the old, still-valid
+    # checkpoint in place instead of a half-written/corrupt one.
+    lane_path = _checkpoint_lane_path(checkpoint_dir, lane_id)
+    tmp_path = lane_path + ".tmp"
+    with open(tmp_path, "w") as fh:
+        fh.write(str(last_a))
+    os.replace(tmp_path, lane_path)
 
 
 def _worker_search(task):
-    """Runs in a worker process (Stage 3, --workers): searches one shard of
-    `a` values via search_bricks, printing/logging its own finds as it goes
-    (prefixed with the worker id) instead of returning everything to the
-    main process to report at the end -- that would buffer all output
-    until the whole run finishes, losing the live progress a long
-    unattended search depends on. Returns (bricks_found, perfect_found) so
-    the main process can print a final summary.
+    """Runs in a worker process (Stage 3, --workers): searches one lane of
+    `a` values, printing/logging its own finds as it goes (prefixed with
+    the worker id) instead of returning everything to the main process to
+    report at the end -- that would buffer all output until the whole run
+    finishes, losing the live progress a long unattended search depends
+    on. Returns (bricks_found, perfect_found) so the main process can
+    print a final summary.
+
+    Iterates `a` one at a time (via _bricks_for_a, not search_bricks)
+    rather than a single flat generator so it can persist checkpoint
+    progress (Stage 4, --checkpoint) after each `a` -- most `a` values
+    yield no bricks, so checkpointing only when a brick is found would
+    leave the checkpoint stale for long, unpredictable stretches.
     """
-    a_start, range_end, prune, perfect_only, stride, worker_id, part_log_path = task
+    a_start, range_end, prune, perfect_only, stride, worker_id, part_log_path, checkpoint_dir = task
     writer = None
     log_fh = None
+    logged_keys = None
     if part_log_path:
-        log_fh = open(part_log_path, "w", newline="")
+        is_new = not os.path.exists(part_log_path)
+        if checkpoint_dir and not is_new:
+            # Resuming: this lane's part-log may already hold results from
+            # past the last checkpoint save (checkpoints save every
+            # CHECKPOINT_INTERVAL `a` values, not every one) -- dedupe
+            # against them instead of re-logging the same bricks. See
+            # ROADMAP.md Stage 4 for how this was caught.
+            logged_keys = load_logged_keys(part_log_path)
+        log_fh = open(part_log_path, "a", newline="")  # append: a resumed run's
+        # earlier (pre-interruption) results for this lane must survive, not be
+        # truncated just because this invocation resumes past them.
         writer = csv.writer(log_fh)
-        writer.writerow(["a", "b", "c", "dZY", "dXZ", "dXY", "space_diagonal", "perfect_cuboid"])
+        if is_new:
+            writer.writerow(["a", "b", "c", "dZY", "dXZ", "dXY", "space_diagonal", "perfect_cuboid"])
     bricks_found = 0
     perfect_found = 0
+    last_checkpoint_a = a_start - stride
     try:
-        a_values = range(a_start, range_end, stride)
-        for a, b, c, d, e, f in search_bricks(a_values, range_end, prune, perfect_only):
-            g_ok, g = EulerBrick.is_perfect_square(a*a + b*b + c*c)
-            if g_ok:
-                perfect_found += 1
-            elif perfect_only:
-                continue  # perfect_only: only report/log/count verified perfect cuboids
-            bricks_found += 1
-            tag = "[!!!] PERFECT CUBOID FOUND" if g_ok else "[Info] Found 'brick'"
-            print("[W{}] {} -- {}:{}:{}  dZY={} dXZ={} dXY={}{}".format(
-                worker_id, tag, c, b, a, d, e, f,
-                "  g={}".format(g) if g_ok else ""))
-            if writer:
-                writer.writerow([a, b, c, d, e, f, g if g_ok else "", g_ok])
+        for a in range(a_start, range_end, stride):
+            for _, b, c, d, e, f in _bricks_for_a(a, range_end, prune, perfect_only):
+                g_ok, g = EulerBrick.is_perfect_square(a*a + b*b + c*c)
+                if g_ok:
+                    perfect_found += 1
+                elif perfect_only:
+                    continue  # perfect_only: only report/log/count verified perfect cuboids
+                if logged_keys is not None:
+                    key = (a, b, c)
+                    if key in logged_keys:
+                        continue
+                    logged_keys.add(key)
+                bricks_found += 1
+                tag = "[!!!] PERFECT CUBOID FOUND" if g_ok else "[Info] Found 'brick'"
+                print("[W{}] {} -- {}:{}:{}  dZY={} dXZ={} dXY={}{}".format(
+                    worker_id, tag, c, b, a, d, e, f,
+                    "  g={}".format(g) if g_ok else ""))
+                if writer:
+                    writer.writerow([a, b, c, d, e, f, g if g_ok else "", g_ok])
+            if checkpoint_dir and (a - last_checkpoint_a) >= CHECKPOINT_INTERVAL * stride:
+                # Flush the log BEFORE saving the checkpoint, not after: log_fh
+                # stays open (and buffered) for this whole function, unlike
+                # log_result's open-write-close-per-row, so without this a hard
+                # kill (timeout/SIGTERM skips `finally`) can lose buffered rows
+                # for `a` values the checkpoint already claims are done --
+                # caught via an actual interrupt-and-resume test, see
+                # ROADMAP.md Stage 4.
+                if log_fh:
+                    log_fh.flush()
+                save_lane_progress(checkpoint_dir, worker_id, a)
+                last_checkpoint_a = a
+        if checkpoint_dir:
+            # Loop finished normally (not killed) -- this lane is fully done.
+            if log_fh:
+                log_fh.flush()
+            save_lane_progress(checkpoint_dir, worker_id, range_end - 1)
     finally:
         if log_fh:
             log_fh.close()
@@ -281,6 +454,8 @@ class EulerBrick(object):
         self.prune = False
         self.perfect_only = False
         self.workers = 1
+        self.checkpoint_dir = None
+        self._logged_keys = None  # set of (a,b,c) already in self.log_file, when resuming a checkpoint
 
     def banner(self):
         print(75*"=")
@@ -305,6 +480,7 @@ class EulerBrick(object):
             self.prune = args.prune
             self.perfect_only = args.perfect_only
             self.workers = args.workers
+            self.checkpoint_dir = args.checkpoint_dir
         else:
             self.mode = input(" -Set mode: manual (default), learning (M/l): ")
             self.root = input(" -Set range (ex: 1-1000 or 1000-1000000 (PRESS ENTER = 1-1000) (STOP = CTRL+z): ")
@@ -316,6 +492,7 @@ class EulerBrick(object):
             self.prune = False
             self.perfect_only = False
             self.workers = 1
+            self.checkpoint_dir = None
         print("\n[Info] Looking for 'bricks' in the range: "+ str(self.root)+ "\n")
         if self.workers > 1:
             self.generate_bricks_parallel(self.root, self.workers)
@@ -352,6 +529,16 @@ class EulerBrick(object):
     def log_result(self, a, b, c, d, e, f, g, perfect):
         if not self.log_file:
             return
+        if self._logged_keys is not None:
+            # Checkpointed run: the redo window between the last checkpoint
+            # save and the actual interruption point gets re-searched on
+            # resume (checkpoints are saved periodically, not after every
+            # single `a`), which would otherwise re-log the same bricks --
+            # see ROADMAP.md Stage 4 for how this was caught.
+            key = (a, b, c)
+            if key in self._logged_keys:
+                return
+            self._logged_keys.add(key)
         is_new = not os.path.exists(self.log_file)
         with open(self.log_file, "a", newline="") as fh:
             writer = csv.writer(fh)
@@ -396,6 +583,12 @@ class EulerBrick(object):
         report_brick suppresses anything that isn't a verified perfect
         cuboid (see PERFECT_ONLY_SIMPLE_MODS and perfect_only_requirements
         above for exactly what's checked and why it's safe to apply).
+
+        With self.checkpoint_dir (Stage 4, --checkpoint), periodically
+        persists the highest `a` fully processed so an interrupted run can
+        resume instead of restarting from the beginning of the range.
+        log_result() already appends rather than truncates, so a resumed
+        run's earlier results survive automatically.
         """
         minrange, maxrange = self._parse_range(rng)
         self.init = minrange
@@ -403,10 +596,30 @@ class EulerBrick(object):
         n = 0
         if not self.no_gui and not os.path.exists(self.store_bricks):
             os.mkdir(self.store_bricks)
-        a_values = range(max(self.init, 1), self.end)
-        for a, b, c, d, e, f in search_bricks(a_values, self.end, self.prune, self.perfect_only):
-            n += 1
-            self.report_brick(a, b, c, d, e, f, n)
+        a_start = max(self.init, 1)
+
+        if self.checkpoint_dir:
+            settings = checkpoint_settings(a_start, self.end, self.prune, self.perfect_only, workers=1)
+            a_resume = load_or_init_checkpoint(self.checkpoint_dir, settings, num_lanes=1)[0]
+            if a_resume >= self.end:
+                print("[Info] Checkpoint shows this range is already complete; nothing to do.\n")
+                return
+            if a_resume > a_start:
+                print("[Info] Resuming from a={} (of {}-{})\n".format(a_resume, a_start, self.end))
+            self._logged_keys = load_logged_keys(self.log_file)
+        else:
+            a_resume = a_start
+
+        last_checkpoint_a = a_resume - 1
+        for a in range(a_resume, self.end):
+            for _, b, c, d, e, f in _bricks_for_a(a, self.end, self.prune, self.perfect_only):
+                n += 1
+                self.report_brick(a, b, c, d, e, f, n)
+            if self.checkpoint_dir and (a - last_checkpoint_a) >= CHECKPOINT_INTERVAL:
+                save_lane_progress(self.checkpoint_dir, 0, a)
+                last_checkpoint_a = a
+        if self.checkpoint_dir:
+            save_lane_progress(self.checkpoint_dir, 0, self.end - 1)
 
     def generate_bricks_parallel(self, rng, workers):
         """Stage 3 (ROADMAP.md): partitions the outer `a` loop across
@@ -425,6 +638,14 @@ class EulerBrick(object):
 
         Requires --no-gui: matplotlib popups across multiple processes
         aren't supported, and draw()'s self.mode prompt doesn't apply here.
+
+        With self.checkpoint_dir (Stage 4, --checkpoint), each lane (one
+        per worker) persists its own progress, and a resumed run picks up
+        each lane where it left off instead of restarting the whole range.
+        If every lane is already complete, returns immediately without
+        touching self.log_file -- rebuilding it from empty/no part files
+        would silently truncate a result set a previous run already
+        finished writing.
         """
         minrange, maxrange = self._parse_range(rng)
         self.init = minrange
@@ -436,18 +657,48 @@ class EulerBrick(object):
             return
         workers = max(1, min(workers, total_a))
 
+        if self.checkpoint_dir:
+            settings = checkpoint_settings(a_start, a_end, self.prune, self.perfect_only, workers)
+            resume_points = load_or_init_checkpoint(self.checkpoint_dir, settings, num_lanes=workers)
+            if all(rp >= a_end for rp in resume_points):
+                print("[Info] Checkpoint shows this range is already complete; nothing to do.\n")
+                return
+        else:
+            resume_points = [a_start + i for i in range(workers)]
+
         part_paths = [
             "{}.part{}".format(self.log_file, i) if self.log_file else None
             for i in range(workers)
         ]
         tasks = [
-            (a_start + i, a_end, self.prune, self.perfect_only, workers, i, part_paths[i])
+            (resume_points[i], a_end, self.prune, self.perfect_only, workers, i,
+             part_paths[i], self.checkpoint_dir)
             for i in range(workers)
         ]
         print("[Info] Striping a in [{}, {}) round-robin across {} worker process(es)...\n".format(
             a_start, a_end, workers))
         with multiprocessing.Pool(workers) as pool:
-            results = pool.map(_worker_search, tasks)
+            # Installed only now, after Pool(workers) has already forked its
+            # workers: they inherit whatever handler was active at fork time,
+            # and this one should stay parent-only (a worker receiving SIGTERM
+            # from pool.terminate() below should just die immediately, not
+            # also try to raise/unwind this same exception in a function it
+            # isn't wrapped to catch).
+            old_handler = signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(_Interrupted()))
+            try:
+                results = pool.map(_worker_search, tasks)
+            except _Interrupted:
+                # Pool.__exit__ still runs after this (terminate()+join() on
+                # every worker) as this unwinds through the `with` block --
+                # see _Interrupted's docstring. Don't touch self.log_file: the
+                # run didn't finish, and each lane's own part-log/checkpoint
+                # already has whatever it durably completed, ready for the
+                # next --checkpoint resume.
+                print("\n[Info] Interrupted -- worker processes terminated cleanly. "
+                      "Re-run with the same --checkpoint to resume.\n")
+                sys.exit(1)
+            finally:
+                signal.signal(signal.SIGTERM, old_handler)
 
         total_bricks = sum(r[0] for r in results)
         total_perfect = sum(r[1] for r in results)
@@ -589,6 +840,13 @@ def parse_args():
              "independent, so this partitions the range with no overlap). "
              "Requires --no-gui and --range; not combinable with "
              "--brute-force. Default 1 (single process, unchanged).")
+    parser.add_argument("--checkpoint", dest="checkpoint_dir", metavar="DIR",
+        help="Periodically persist search progress to DIR so an "
+             "interrupted run can resume instead of restarting the range "
+             "from the beginning. Refuses to resume a checkpoint created "
+             "with different --range/--prune/--perfect-only/--workers "
+             "settings. Requires --range; not combinable with "
+             "--brute-force.")
     args = parser.parse_args()
     if args.workers > 1:
         if not args.range_:
@@ -597,6 +855,11 @@ def parse_args():
             parser.error("--workers requires --no-gui (matplotlib popups aren't supported across processes).")
         if args.brute_force:
             parser.error("--workers is not combinable with --brute-force.")
+    if args.checkpoint_dir:
+        if not args.range_:
+            parser.error("--checkpoint requires --range (no interactive prompts across a resumable run).")
+        if args.brute_force:
+            parser.error("--checkpoint is not combinable with --brute-force.")
     return args
 
 
