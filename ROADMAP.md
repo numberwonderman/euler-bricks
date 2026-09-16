@@ -122,6 +122,60 @@ interpreter overhead itself, not this specific inefficiency, is the next
 real lever — reinforces that Stage 3 (compiled/vectorized inner loop)
 matters more than further pruning refinement at this scale.
 
+### Stage 2 addendum (session 2) — `--perfect-only`, using a real primary source
+
+After the above shipped, the user pasted the actual text of Wikipedia's
+"Euler brick" article ("Perfect cuboid" section) directly into this
+project — resolving the "WebFetch to primary sources was blocked"
+limitation that kept `--prune` deliberately weak. That text states
+conditions specific to a **primitive** perfect cuboid; since divisibility
+is multiplicative (if the primitive edge is a multiple of `m`, so is any
+scaled-up copy of it), they carry over unchanged to any perfect cuboid's
+raw edges, safe to apply directly:
+
+- one edge odd, one edge divisible by 4, one (different) edge divisible
+  by 16 (implemented as "≥1 edge divisible by 16", a safe subset — 16
+  implies 4, so this can only be weaker than the true condition, never
+  wrongly reject a valid cuboid)
+- **two** edges divisible by 3, at least one of those two *also* by 9
+  (stronger than `PRUNE_MODS`' "one edge by 3" — this is what can prove a
+  whole `(a, b)` pair impossible before considering any `c` at all)
+- one edge divisible by 5, one by 7, one by 11, one by 19
+
+Conditions naming a face diagonal or the space diagonal (divisible by
+13/17/29/37) were skipped — they can't prune before a full candidate
+exists, and the search already does an exact `isqrt` check on the space
+diagonal at that point anyway, so there's little to gain from them.
+
+Implemented as `--perfect-only`: a new mode, not a change to `--prune`
+(these conditions are proven specifically for perfect cuboids, not
+general Euler bricks — applying them to the general search could
+silently reject valid ordinary Euler bricks that just don't happen to
+have this stronger structure). Prunes `(a, b)` pairs outright when
+impossible, and `report_brick`/`_worker_search` suppress anything that
+isn't a verified perfect cuboid (`g_ok`), so `--perfect-only`'s output is
+only ever real perfect cuboids — currently always empty, as expected.
+
+**Verification had to be redesigned mid-implementation**: the first draft
+of `check_perfect_only.py` compared `--perfect-only`'s logged CSV output
+against "candidates satisfying the necessary conditions" — but the CSV
+only ever contains *verified* perfect cuboids (always empty), so that
+comparison would trivially "pass" whether or not the pruning logic was
+actually correct. Caught before running it, not after. Rewrote it to call
+`search_bricks(..., perfect_only=True)` directly and compare which
+`(a, b, c)` survive pruning against a second, independently-written
+function that re-derives the same conditions from scratch — a real test,
+since it can catch a pruning bug even without a known perfect cuboid to
+test against. Verified exact agreement on `1-20,000` (8 of 320 real Euler
+bricks satisfy the necessary conditions) and `1-200,000` (118 of 3,487).
+
+**Performance**: modest, same story as `--prune` — ~5% faster than
+unfiltered at `1-200,000` (7.45s vs 7.86s). Consistent with the earlier
+finding: Python-level loop overhead dominates, not the specific work
+pruning skips, so eliminating whole `(a,b)` pairs early doesn't move the
+needle much until Stage 3's compiled-extension option (skipped, see
+below) is revisited.
+
 ## Stage 3 — Implementation speed — DONE (multiprocessing; compiled extension skipped, see below)
 
 Checked the environment before picking an approach: `gcc` and `rustc` are

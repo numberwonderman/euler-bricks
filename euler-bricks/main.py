@@ -119,7 +119,67 @@ def required_modulus_for_third_edge(a, b, mods=PRUNE_MODS):
     return product
 
 
-def search_bricks(a_values, range_end, prune):
+# Stage 2 addendum: conditions specific to a PERFECT CUBOID (not general
+# Euler bricks), sourced from Wikipedia's "Euler brick" article ("Perfect
+# cuboid" section) after the user pasted its text directly into this
+# project -- WebFetch to it earlier in this project was blocked by network
+# policy, which is why PRUNE_MODS above stayed limited to the weaker,
+# empirically-checked subset. These are stated for a PRIMITIVE perfect
+# cuboid, but divisibility is multiplicative (if the primitive edge is a
+# multiple of m, so is k times it for any k), so they carry over unchanged
+# to any perfect cuboid's raw edges -- safe to apply directly here.
+#
+# Conditions used (edge-only; the ones involving a face diagonal or the
+# space diagonal -- divisible by 13/17/29/37 -- are skipped, since they
+# can't prune before a full candidate exists, and the search already does
+# an exact isqrt check on the space diagonal at that point anyway):
+#   - one edge must be odd
+#   - one edge must be divisible by 16 (the source's parity condition
+#     names a *different* edge divisible only by 4, distinct from the one
+#     divisible by 16 -- requiring 16 alone is a safe subset: divisible by
+#     16 implies divisible by 4, so this can only be weaker than the true
+#     condition, never wrongly reject a valid cuboid)
+#   - one edge divisible by 5, one by 7, one by 11, one by 19
+#   - TWO edges divisible by 3, and at least one of those two also by 9
+#     (stronger than PRUNE_MODS' "one edge by 3" -- this is what can prove
+#     a whole (a, b) pair impossible before ever considering a c)
+PERFECT_ONLY_SIMPLE_MODS = (5, 7, 11, 16, 19)
+
+
+def perfect_only_requirements(a, b):
+    """Given two edges of a candidate perfect cuboid, what must the third
+    edge (c) satisfy -- or is this (a, b) pair already impossible?
+
+    Returns None if no c could complete a valid perfect-cuboid candidate
+    with this (a, b) -- skip the pair entirely -- otherwise
+    (required_mod, required_odd): the combined modulus (product of
+    whichever of PERFECT_ONLY_SIMPLE_MODS, plus 3 or 9 if needed, aren't
+    already covered by a or b -- all pairwise coprime, so a single product
+    check is valid) c must be divisible by, and whether c must be odd.
+    """
+    a3, b3 = a % 3 == 0, b % 3 == 0
+    a9, b9 = a % 9 == 0, b % 9 == 0
+    count3 = a3 + b3
+    extra_mod = 1
+    if count3 == 0:
+        return None  # c alone can't supply "two edges divisible by 3"
+    elif count3 == 1:
+        if a9 or b9:
+            extra_mod = 3
+        else:
+            extra_mod = 9  # c must cover both "divisible by 3" and "by 9"
+    else:  # count3 == 2
+        if not (a9 or b9):
+            return None  # neither 3-divisible edge is 9-divisible; c can't fix that retroactively
+
+    required_mod = required_modulus_for_third_edge(a, b, mods=PERFECT_ONLY_SIMPLE_MODS)
+    if extra_mod != 1 and required_mod % extra_mod != 0:
+        required_mod *= extra_mod
+    required_odd = (a % 2 == 0) and (b % 2 == 0)
+    return required_mod, required_odd
+
+
+def search_bricks(a_values, range_end, prune, perfect_only=False):
     """Yields (a, b, c, d, e, f) Euler-brick tuples for each a in a_values,
     checked against the shared range_end bound (b, c < range_end).
 
@@ -132,6 +192,16 @@ def search_bricks(a_values, range_end, prune):
     workers) per worker, so factoring cost -- which grows with a -- is
     spread evenly across workers instead of dumping all the expensive
     large-a work on whichever worker got the last contiguous block).
+
+    perfect_only (Stage 2 addendum) applies the stronger, perfect-cuboid-
+    specific conditions above instead of -- not in addition to -- `prune`'s
+    general-Euler-brick-safe conditions, including skipping an (a, b) pair
+    outright when it's already provably impossible. Still yields ordinary
+    (non-perfect) Euler bricks that happen to pass -- most candidates that
+    satisfy these necessary conditions still won't have an integer space
+    diagonal -- the caller decides whether to report those (see
+    report_brick / _worker_search, which check g_ok before printing/
+    logging when perfect_only is set).
     """
     for a in a_values:
         partners_a = [(v, diag) for (v, diag) in pythagorean_partners(a) if a < v < range_end]
@@ -139,11 +209,22 @@ def search_bricks(a_values, range_end, prune):
             continue
         a_diag_for = dict(partners_a)
         for b, d in partners_a:
-            required_mod = required_modulus_for_third_edge(a, b) if prune else 1
+            required_odd = False
+            if perfect_only:
+                req = perfect_only_requirements(a, b)
+                if req is None:
+                    continue
+                required_mod, required_odd = req
+            elif prune:
+                required_mod = required_modulus_for_third_edge(a, b)
+            else:
+                required_mod = 1
             for c, f in pythagorean_partners(b):
                 if c <= b or c >= range_end:
                     continue
                 if required_mod != 1 and c % required_mod != 0:
+                    continue
+                if required_odd and c % 2 == 0:
                     continue
                 e = a_diag_for.get(c)
                 if e is None:
@@ -160,7 +241,7 @@ def _worker_search(task):
     unattended search depends on. Returns (bricks_found, perfect_found) so
     the main process can print a final summary.
     """
-    a_start, range_end, prune, stride, worker_id, part_log_path = task
+    a_start, range_end, prune, perfect_only, stride, worker_id, part_log_path = task
     writer = None
     log_fh = None
     if part_log_path:
@@ -171,11 +252,13 @@ def _worker_search(task):
     perfect_found = 0
     try:
         a_values = range(a_start, range_end, stride)
-        for a, b, c, d, e, f in search_bricks(a_values, range_end, prune):
-            bricks_found += 1
+        for a, b, c, d, e, f in search_bricks(a_values, range_end, prune, perfect_only):
             g_ok, g = EulerBrick.is_perfect_square(a*a + b*b + c*c)
             if g_ok:
                 perfect_found += 1
+            elif perfect_only:
+                continue  # perfect_only: only report/log/count verified perfect cuboids
+            bricks_found += 1
             tag = "[!!!] PERFECT CUBOID FOUND" if g_ok else "[Info] Found 'brick'"
             print("[W{}] {} -- {}:{}:{}  dZY={} dXZ={} dXY={}{}".format(
                 worker_id, tag, c, b, a, d, e, f,
@@ -196,6 +279,7 @@ class EulerBrick(object):
         self.log_file = None
         self.brute_force = False
         self.prune = False
+        self.perfect_only = False
         self.workers = 1
 
     def banner(self):
@@ -219,6 +303,7 @@ class EulerBrick(object):
             self.log_file = args.log_file
             self.brute_force = args.brute_force
             self.prune = args.prune
+            self.perfect_only = args.perfect_only
             self.workers = args.workers
         else:
             self.mode = input(" -Set mode: manual (default), learning (M/l): ")
@@ -229,6 +314,7 @@ class EulerBrick(object):
             self.log_file = None
             self.brute_force = False
             self.prune = False
+            self.perfect_only = False
             self.workers = 1
         print("\n[Info] Looking for 'bricks' in the range: "+ str(self.root)+ "\n")
         if self.workers > 1:
@@ -275,6 +361,8 @@ class EulerBrick(object):
 
     def report_brick(self, a, b, c, d, e, f, n):
         g_ok, g = self.is_perfect_square(a*a + b*b + c*c)
+        if self.perfect_only and not g_ok:
+            return  # perfect_only: only report/log/draw verified perfect cuboids
         print(40*"-"+"\n")
         if g_ok:
             print("[!!!] PERFECT CUBOID FOUND -- space diagonal is also an integer!\n")
@@ -302,6 +390,12 @@ class EulerBrick(object):
         that cannot satisfy the empirically-validated-but-not-proven
         necessary divisibility conditions in PRUNE_MODS -- see the comment
         above PRUNE_MODS for exactly what that means and its caveats.
+
+        With self.perfect_only (Stage 2 addendum, --perfect-only), applies
+        the stronger perfect-cuboid-specific conditions instead, and
+        report_brick suppresses anything that isn't a verified perfect
+        cuboid (see PERFECT_ONLY_SIMPLE_MODS and perfect_only_requirements
+        above for exactly what's checked and why it's safe to apply).
         """
         minrange, maxrange = self._parse_range(rng)
         self.init = minrange
@@ -309,7 +403,8 @@ class EulerBrick(object):
         n = 0
         if not self.no_gui and not os.path.exists(self.store_bricks):
             os.mkdir(self.store_bricks)
-        for a, b, c, d, e, f in search_bricks(range(max(self.init, 1), self.end), self.end, self.prune):
+        a_values = range(max(self.init, 1), self.end)
+        for a, b, c, d, e, f in search_bricks(a_values, self.end, self.prune, self.perfect_only):
             n += 1
             self.report_brick(a, b, c, d, e, f, n)
 
@@ -346,7 +441,7 @@ class EulerBrick(object):
             for i in range(workers)
         ]
         tasks = [
-            (a_start + i, a_end, self.prune, workers, i, part_paths[i])
+            (a_start + i, a_end, self.prune, self.perfect_only, workers, i, part_paths[i])
             for i in range(workers)
         ]
         print("[Info] Striping a in [{}, {}) round-robin across {} worker process(es)...\n".format(
@@ -483,6 +578,12 @@ def parse_args():
              "validated (see ROADMAP.md Stage 2 and check_prune.py) but not "
              "confirmed against a primary source -- cross-check with "
              "check_prune.py before trusting it on a large unattended run.")
+    parser.add_argument("--perfect-only", action="store_true",
+        help="Only report verified perfect cuboids (suppresses ordinary "
+             "Euler bricks) and prunes using the stronger, "
+             "perfect-cuboid-specific conditions sourced from Wikipedia's "
+             "Euler brick article (see ROADMAP.md Stage 2 addendum and "
+             "check_perfect_only.py). Supersedes --prune if both are given.")
     parser.add_argument("--workers", type=int, default=1, metavar="N",
         help="Split the search across N worker processes (each `a` is "
              "independent, so this partitions the range with no overlap). "
