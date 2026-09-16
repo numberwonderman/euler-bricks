@@ -122,14 +122,85 @@ interpreter overhead itself, not this specific inefficiency, is the next
 real lever — reinforces that Stage 3 (compiled/vectorized inner loop)
 matters more than further pruning refinement at this scale.
 
-## Stage 3 — Implementation speed
+## Stage 3 — Implementation speed — DONE (multiprocessing; compiled extension skipped, see below)
 
-- Move the hot inner loop out of plain Python: a compiled extension
-  (Cython, or Rust via PyO3) for the divisor-pair generation and
-  intersection, or at minimum vectorize with numpy.
-- `multiprocessing` sharding across ranges of `a` — each `a` is fully
-  independent, so this parallelizes with no coordination overhead beyond
-  merging result logs.
+Checked the environment before picking an approach: `gcc` and `rustc` are
+both present here, but neither `Cython` nor `numpy` is installed, and this
+tool's own README promises it "runs on many platforms" with just
+`python3` — no compiler, no package installs. A Cython/Rust extension
+would mean every user needs a working C or Rust toolchain just to get the
+speed win, which doesn't fit a project whose entire installation story is
+"you need Python 3." So Stage 3 implements the other option the roadmap
+listed: `multiprocessing`, stdlib-only, works anywhere Python does.
+
+**Implemented**: `--workers N`. `search_bricks()` (the core algorithm) was
+factored out to a module-level, side-effect-free generator shared by the
+single-process path (`generate_bricks_fast`) and each worker
+(`_worker_search`) — one implementation to trust instead of two that could
+silently diverge. Requires `--range` and `--no-gui` (validated at the
+argparse level); not combinable with `--brute-force`.
+
+Each `a` produces bricks attributed to it alone (`b`, `c` are always `>
+a`), so partitioning the outer `a` loop across workers is exact — no
+duplicate or missed bricks, no coordination needed beyond merging each
+worker's CSV part-file at the end. Workers are assigned `a` values
+**round-robin** (worker `i` gets `a_start+i, a_start+i+workers, ...`)
+rather than contiguous blocks, because factoring cost grows with `a` —
+contiguous chunking left whichever worker got the largest-`a` block
+running long after the others finished.
+
+Verified identical results (serial vs. `--workers 4`) on `1-20,000` (320
+bricks, byte-identical after sorting).
+
+**Performance reality check**: on this 4-CPU sandbox (confirmed via
+`nproc`/cgroup — no quota throttling), `--workers 4` measured **~1.6x**
+wall-clock speedup at `1-1,000,000` (53.7s → 33.3s), not the ideal ~4x.
+Switching from contiguous to round-robin partitioning didn't meaningfully
+change this (33.3s either way) — so the imbalance measured between shards
+(~1.8x cost ratio, largest-`a` shard vs. smallest) wasn't the dominant
+limiter. The likely cause: each worker process has its own
+`pythagorean_partners()` `lru_cache` (Stage 1), so a `b` value factored by
+one worker gets silently re-factored by every other worker that also
+touches it — real duplicated work with no way to share it across
+processes without adding a shared-cache layer (out of scope for this
+stage).
+
+**Second, more serious finding, at `1-2,000,000`**: single-process
+completed in 2m13.7s. The 4-worker run was killed partway through (not
+allowed to finish) after its 3 CPU-bound processes' RSS climbed past
+4.3GB *each* (12GB+ total) with no cap, on a 15GB-total sandbox with no
+swap configured -- confirmed via `free -h`, not inferred. CPU utilization
+per worker had already dropped from ~72% to ~25% and process state moved
+from running to sleeping before the kill, consistent with memory
+pressure. This is the same unbounded `lru_cache(maxsize=None)` from Stage
+1: fine for one process, but `--workers N` multiplies that memory cost by
+N with no sharing between them, and it scales with the search range, not
+with a fixed budget. Left running, this range would very plausibly have
+OOM-killed the container rather than finished.
+
+**Fixed, not just documented**: `pythagorean_partners()`'s `lru_cache` was
+switched from `maxsize=None` to a measured, bounded size. Caching
+`a=1..1,000,000` in one process was measured at ~3.3KB/entry (mostly
+`lru_cache`'s own bookkeeping, not the data) -> ~3.3GB for a million
+entries, which is where the incident's per-worker RSS came from almost
+exactly. `maxsize=200_000` caps that at ~550MB/process. Re-ran the exact
+scenario that broke before (`--workers 4`, `1-2,000,000`, watched every
+10s): total RSS across 4 workers now **plateaus at ~8.7GB and holds flat**
+instead of climbing past 12.7GB and still rising. Re-verified correctness
+after the change (`check_prune.py` on `1-20,000`, unchanged: 320 bricks,
+byte-identical).
+
+8.7GB across 4 workers is still substantial for a modest machine -- a
+`--cache-size` CLI flag so users can tune the tradeoff for their own RAM
+would be a reasonable follow-up, not implemented here to keep this stage's
+scope to "make the discovered risk safe," not "make it configurable."
+
+**Practical consequence**: `--workers` is correct (verified identical
+results vs. serial on `1-20,000`) and gives a real, if sub-linear, speedup
+at moderate ranges (~1.6x on 4 cores at `1-1,000,000`). Memory is now
+bounded rather than unbounded, but still substantial per worker -- check
+`free -h` against `--workers N` × ~550MB before pointing it at a large
+range on a memory-constrained machine.
 
 ## Stage 4 — Checkpointing & resumability
 

@@ -16,6 +16,7 @@ Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 import argparse
 import csv
 import math
+import multiprocessing
 import os
 import sys
 from functools import lru_cache
@@ -43,7 +44,22 @@ def _divisors_from_factors(factors):
     return divs
 
 
-@lru_cache(maxsize=None)
+# Bounded, not unbounded: found via a real incident (see ROADMAP.md Stage
+# 3) where --workers 4 on 1-2,000,000 pushed each worker's RSS past 4.3GB
+# with no cap -- 12GB+ total on a 15GB sandbox with no swap -- and had to
+# be killed before it plausibly OOM'd the container. Every worker process
+# has its own copy of this cache (no cross-process sharing), so
+# --workers N multiplies whatever this holds by N.
+#
+# maxsize is picked from a measured cost, not a guess: caching a=1..1M in
+# one process measured ~3.3KB/entry (mostly lru_cache's own bookkeeping,
+# not the data itself) -> ~3.3GB for a million entries, matching the
+# incident above almost exactly. 200,000 entries caps that at ~550MB per
+# process (~2.2GB total at --workers 4), leaving headroom on an ordinary
+# machine, not just this sandbox. Stage 2's profiling already found
+# factoring isn't the search's bottleneck, so trading some re-factoring
+# of evicted values for a hard memory ceiling is cheap.
+@lru_cache(maxsize=200_000)
 def pythagorean_partners(a):
     """All (b, d) with a^2 + b^2 = d^2 and b > 0.
 
@@ -103,6 +119,75 @@ def required_modulus_for_third_edge(a, b, mods=PRUNE_MODS):
     return product
 
 
+def search_bricks(a_values, range_end, prune):
+    """Yields (a, b, c, d, e, f) Euler-brick tuples for each a in a_values,
+    checked against the shared range_end bound (b, c < range_end).
+
+    Module-level and side-effect-free (no printing/logging/drawing) so it
+    is exactly the same code path for the single-process search
+    (generate_bricks_fast) and each worker in the multiprocessing search
+    (Stage 3, --workers) -- one implementation to trust instead of two
+    that could silently diverge. a_values is any iterable (a contiguous
+    range for the single-process case; a strided range.range(start, end,
+    workers) per worker, so factoring cost -- which grows with a -- is
+    spread evenly across workers instead of dumping all the expensive
+    large-a work on whichever worker got the last contiguous block).
+    """
+    for a in a_values:
+        partners_a = [(v, diag) for (v, diag) in pythagorean_partners(a) if a < v < range_end]
+        if not partners_a:
+            continue
+        a_diag_for = dict(partners_a)
+        for b, d in partners_a:
+            required_mod = required_modulus_for_third_edge(a, b) if prune else 1
+            for c, f in pythagorean_partners(b):
+                if c <= b or c >= range_end:
+                    continue
+                if required_mod != 1 and c % required_mod != 0:
+                    continue
+                e = a_diag_for.get(c)
+                if e is None:
+                    continue
+                yield (a, b, c, d, e, f)
+
+
+def _worker_search(task):
+    """Runs in a worker process (Stage 3, --workers): searches one shard of
+    `a` values via search_bricks, printing/logging its own finds as it goes
+    (prefixed with the worker id) instead of returning everything to the
+    main process to report at the end -- that would buffer all output
+    until the whole run finishes, losing the live progress a long
+    unattended search depends on. Returns (bricks_found, perfect_found) so
+    the main process can print a final summary.
+    """
+    a_start, range_end, prune, stride, worker_id, part_log_path = task
+    writer = None
+    log_fh = None
+    if part_log_path:
+        log_fh = open(part_log_path, "w", newline="")
+        writer = csv.writer(log_fh)
+        writer.writerow(["a", "b", "c", "dZY", "dXZ", "dXY", "space_diagonal", "perfect_cuboid"])
+    bricks_found = 0
+    perfect_found = 0
+    try:
+        a_values = range(a_start, range_end, stride)
+        for a, b, c, d, e, f in search_bricks(a_values, range_end, prune):
+            bricks_found += 1
+            g_ok, g = EulerBrick.is_perfect_square(a*a + b*b + c*c)
+            if g_ok:
+                perfect_found += 1
+            tag = "[!!!] PERFECT CUBOID FOUND" if g_ok else "[Info] Found 'brick'"
+            print("[W{}] {} -- {}:{}:{}  dZY={} dXZ={} dXY={}{}".format(
+                worker_id, tag, c, b, a, d, e, f,
+                "  g={}".format(g) if g_ok else ""))
+            if writer:
+                writer.writerow([a, b, c, d, e, f, g if g_ok else "", g_ok])
+    finally:
+        if log_fh:
+            log_fh.close()
+    return bricks_found, perfect_found
+
+
 class EulerBrick(object):
     def __init__(self):
         self.store_bricks = "bricks/"
@@ -111,6 +196,7 @@ class EulerBrick(object):
         self.log_file = None
         self.brute_force = False
         self.prune = False
+        self.workers = 1
 
     def banner(self):
         print(75*"=")
@@ -133,6 +219,7 @@ class EulerBrick(object):
             self.log_file = args.log_file
             self.brute_force = args.brute_force
             self.prune = args.prune
+            self.workers = args.workers
         else:
             self.mode = input(" -Set mode: manual (default), learning (M/l): ")
             self.root = input(" -Set range (ex: 1-1000 or 1000-1000000 (PRESS ENTER = 1-1000) (STOP = CTRL+z): ")
@@ -142,8 +229,11 @@ class EulerBrick(object):
             self.log_file = None
             self.brute_force = False
             self.prune = False
+            self.workers = 1
         print("\n[Info] Looking for 'bricks' in the range: "+ str(self.root)+ "\n")
-        if self.brute_force:
+        if self.workers > 1:
+            self.generate_bricks_parallel(self.root, self.workers)
+        elif self.brute_force:
             self.generate_bricks_bruteforce(self.root)
         else:
             self.generate_bricks_fast(self.root)
@@ -219,23 +309,69 @@ class EulerBrick(object):
         n = 0
         if not self.no_gui and not os.path.exists(self.store_bricks):
             os.mkdir(self.store_bricks)
-        for a in range(max(self.init, 1), self.end):
-            partners_a = [(v, diag) for (v, diag) in pythagorean_partners(a) if a < v < self.end]
-            if not partners_a:
-                continue
-            a_diag_for = dict(partners_a)
-            for b, d in partners_a:
-                required_mod = required_modulus_for_third_edge(a, b) if self.prune else 1
-                for c, f in pythagorean_partners(b):
-                    if c <= b or c >= self.end:
-                        continue
-                    if required_mod != 1 and c % required_mod != 0:
-                        continue
-                    e = a_diag_for.get(c)
-                    if e is None:
-                        continue
-                    n += 1
-                    self.report_brick(a, b, c, d, e, f, n)
+        for a, b, c, d, e, f in search_bricks(range(max(self.init, 1), self.end), self.end, self.prune):
+            n += 1
+            self.report_brick(a, b, c, d, e, f, n)
+
+    def generate_bricks_parallel(self, rng, workers):
+        """Stage 3 (ROADMAP.md): partitions the outer `a` loop across
+        `workers` processes. Each `a` produces bricks attributed to it
+        alone (b, c are always > a), so splitting the outer loop into
+        non-overlapping subsets partitions the result set exactly -- no
+        duplicate or missed bricks, no coordination needed between workers
+        beyond merging their output at the end.
+
+        Workers are assigned a values round-robin (worker i gets
+        a_start+i, a_start+i+workers, a_start+i+2*workers, ...) rather than
+        contiguous blocks: per-a cost grows with a (bigger numbers take
+        longer to factor), so a contiguous "last worker gets the largest
+        a's" split leaves that worker running long after the others finish.
+        Striping spreads cheap and expensive a's evenly across workers.
+
+        Requires --no-gui: matplotlib popups across multiple processes
+        aren't supported, and draw()'s self.mode prompt doesn't apply here.
+        """
+        minrange, maxrange = self._parse_range(rng)
+        self.init = minrange
+        self.end = maxrange
+        a_start = max(self.init, 1)
+        a_end = self.end
+        total_a = a_end - a_start
+        if total_a <= 0:
+            return
+        workers = max(1, min(workers, total_a))
+
+        part_paths = [
+            "{}.part{}".format(self.log_file, i) if self.log_file else None
+            for i in range(workers)
+        ]
+        tasks = [
+            (a_start + i, a_end, self.prune, workers, i, part_paths[i])
+            for i in range(workers)
+        ]
+        print("[Info] Striping a in [{}, {}) round-robin across {} worker process(es)...\n".format(
+            a_start, a_end, workers))
+        with multiprocessing.Pool(workers) as pool:
+            results = pool.map(_worker_search, tasks)
+
+        total_bricks = sum(r[0] for r in results)
+        total_perfect = sum(r[1] for r in results)
+        print("\n"+40*"-")
+        print("[Info] Done. {} brick(s) found across {} worker(s) ({} perfect cuboid(s)).".format(
+            total_bricks, workers, total_perfect))
+
+        if self.log_file:
+            with open(self.log_file, "w", newline="") as out_fh:
+                writer = csv.writer(out_fh)
+                writer.writerow(["a", "b", "c", "dZY", "dXZ", "dXY", "space_diagonal", "perfect_cuboid"])
+                for part_path in part_paths:
+                    if part_path and os.path.exists(part_path):
+                        with open(part_path, newline="") as in_fh:
+                            reader = csv.reader(in_fh)
+                            next(reader, None)  # skip that shard's own header
+                            for row in reader:
+                                writer.writerow(row)
+                        os.remove(part_path)
 
     def generate_bricks_bruteforce(self, rng):
         """Original O(n^2)-ish triple-loop search, kept for cross-checking
@@ -347,7 +483,20 @@ def parse_args():
              "validated (see ROADMAP.md Stage 2 and check_prune.py) but not "
              "confirmed against a primary source -- cross-check with "
              "check_prune.py before trusting it on a large unattended run.")
-    return parser.parse_args()
+    parser.add_argument("--workers", type=int, default=1, metavar="N",
+        help="Split the search across N worker processes (each `a` is "
+             "independent, so this partitions the range with no overlap). "
+             "Requires --no-gui and --range; not combinable with "
+             "--brute-force. Default 1 (single process, unchanged).")
+    args = parser.parse_args()
+    if args.workers > 1:
+        if not args.range_:
+            parser.error("--workers requires --range (no interactive prompts across processes).")
+        if not args.no_gui:
+            parser.error("--workers requires --no-gui (matplotlib popups aren't supported across processes).")
+        if args.brute_force:
+            parser.error("--workers is not combinable with --brute-force.")
+    return args
 
 
 if __name__ == "__main__":
