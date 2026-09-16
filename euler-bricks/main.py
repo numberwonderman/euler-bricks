@@ -71,6 +71,38 @@ def pythagorean_partners(a):
     return tuple(sorted(results))
 
 
+# Stage 2 (ROADMAP.md): necessary conditions on an Euler brick's three edges
+# -- at least one edge divisible by 3, one by 4, one by 5, one by 11 --
+# reported by multiple secondary sources discussing perfect-cuboid
+# constraints (Leech 1977; Lal & Blundon), traced back to the classical
+# Euler-brick parametrization. WebFetch to the primary sources (Wikipedia,
+# MathWorld, the Roberts 2010 AustMS paper) was blocked by this session's
+# network policy, so these were NOT verified against a primary source --
+# only empirically, against every real Euler brick this tool found in
+# 1-3,000 (39 bricks) and 1-20,000 (320 bricks): zero violations of any of
+# the four conditions in either run. That is reassuring but not a proof, so
+# this stays opt-in (--prune) rather than folded into the default search,
+# and check_prune.py exists to re-validate --prune against the unpruned
+# search on any range before trusting it for an unattended run.
+PRUNE_MODS = (3, 4, 5, 11)
+
+
+def required_modulus_for_third_edge(a, b, mods=PRUNE_MODS):
+    """Given two edges of a candidate brick, what single modulus must the
+    third edge be divisible by, because neither a nor b already covers all
+    of `mods`? (If a or b already covers a given modulus, the third edge is
+    unconstrained by it.) Returns the product of the still-unsatisfied
+    mods -- valid as a single combined check because PRUNE_MODS are
+    pairwise coprime -- or 1 if a and b together already satisfy all of
+    them (no constraint on the third edge).
+    """
+    product = 1
+    for m in mods:
+        if a % m != 0 and b % m != 0:
+            product *= m
+    return product
+
+
 class EulerBrick(object):
     def __init__(self):
         self.store_bricks = "bricks/"
@@ -78,6 +110,7 @@ class EulerBrick(object):
         self.no_gui = False
         self.log_file = None
         self.brute_force = False
+        self.prune = False
 
     def banner(self):
         print(75*"=")
@@ -99,6 +132,7 @@ class EulerBrick(object):
             self.no_gui = args.no_gui
             self.log_file = args.log_file
             self.brute_force = args.brute_force
+            self.prune = args.prune
         else:
             self.mode = input(" -Set mode: manual (default), learning (M/l): ")
             self.root = input(" -Set range (ex: 1-1000 or 1000-1000000 (PRESS ENTER = 1-1000) (STOP = CTRL+z): ")
@@ -107,6 +141,7 @@ class EulerBrick(object):
             self.no_gui = False
             self.log_file = None
             self.brute_force = False
+            self.prune = False
         print("\n[Info] Looking for 'bricks' in the range: "+ str(self.root)+ "\n")
         if self.brute_force:
             self.generate_bricks_bruteforce(self.root)
@@ -172,6 +207,11 @@ class EulerBrick(object):
         b^2+c^2 square the same way, and keep only the `c`s that also
         appear in a's own partner set (so a^2+c^2 is square too) -- an
         Euler brick, with no wasted scanning of non-candidates.
+
+        With self.prune (Stage 2, --prune), also skips candidate `c` values
+        that cannot satisfy the empirically-validated-but-not-proven
+        necessary divisibility conditions in PRUNE_MODS -- see the comment
+        above PRUNE_MODS for exactly what that means and its caveats.
         """
         minrange, maxrange = self._parse_range(rng)
         self.init = minrange
@@ -185,8 +225,11 @@ class EulerBrick(object):
                 continue
             a_diag_for = dict(partners_a)
             for b, d in partners_a:
+                required_mod = required_modulus_for_third_edge(a, b) if self.prune else 1
                 for c, f in pythagorean_partners(b):
                     if c <= b or c >= self.end:
+                        continue
+                    if required_mod != 1 and c % required_mod != 0:
                         continue
                     e = a_diag_for.get(c)
                     if e is None:
@@ -298,6 +341,12 @@ def parse_args():
         help="Use the original O(n^2)-ish triple-loop search instead of the "
              "divisor-driven one. Slower; mainly useful to cross-check "
              "results on small ranges.")
+    parser.add_argument("--prune", action="store_true",
+        help="Skip candidate edges that cannot satisfy necessary "
+             "divisibility conditions (by 3, 4, 5, 11). Empirically "
+             "validated (see ROADMAP.md Stage 2 and check_prune.py) but not "
+             "confirmed against a primary source -- cross-check with "
+             "check_prune.py before trusting it on a large unattended run.")
     return parser.parse_args()
 
 

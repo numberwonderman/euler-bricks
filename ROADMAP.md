@@ -60,15 +60,67 @@ Factoring is still plain trial division up to `sqrt(a)`, so it degrades on
 very large `a` (this is exactly what Stage 3's sieve/Pollard-rho swap is
 for) — Stage 1 fixes the *algorithm*, not yet the *factoring* implementation.
 
-## Stage 2 — Known number-theoretic filters
+## Stage 2 — Known number-theoretic filters — DONE (opt-in, modest payoff)
 
-Published results on Euler bricks / perfect cuboids give necessary
-divisibility and parity conditions on `a, b, c` (e.g. one edge must be
-divisible by 4, one by 3, one by 5, plus additional modular constraints).
-Checking these first lets us reject candidate `a` values cheaply, before
-paying the cost of factoring `a²` and generating divisor pairs in Stage 1.
-Needs a literature check to get the exact conditions right before encoding
-them (get this wrong and we silently skip real solutions).
+Published sources on Euler bricks / perfect cuboids state necessary
+divisibility conditions on the three edges (one divisible by 3, one by 4,
+one by 5, one by 11 — with perfect-cuboid-specific sources describing
+stronger refinements: 9 instead of 3, 16 instead of 4, plus 7 and 19).
+**WebFetch to the primary sources (Wikipedia, MathWorld, the Roberts 2010
+AustMS paper) was blocked by this session's network policy**, so none of
+this was confirmed against a primary source — only via WebSearch's
+synthesized summaries of secondary discussion. Given that a wrong filter
+here would *silently skip a real solution* — the one failure mode this
+whole project exists to avoid — only the weaker, doubly-corroborated
+subset (3, 4, 5, 11 — not the 9/16/7/19 refinements) was implemented, and
+only as **strictly opt-in** (`--prune`), never folded into the default
+search.
+
+Before trusting even that: ran an empirical check across every real Euler
+brick this tool found in `1-3,000` (39 bricks) and `1-20,000` (320 bricks)
+— zero violations of any of the four conditions in either range. That's
+consistent with these being classical theorems about *all* Euler bricks
+(provable from Euler's parametrization), not extra constraints specific to
+perfect cuboids, but 320 samples isn't a proof either. `check_prune.py` was
+added to make this checkable on demand: it runs the same range pruned and
+unpruned and diffs the results. **Run it on a representative sample of any
+range before trusting `--prune` on an unattended search** — it's what
+caught the one real bug in this stage (see below).
+
+**Implemented** as `required_modulus_for_third_edge(a, b)` in `main.py`:
+given two edges already fixed, returns the single combined modulus (using
+that 3, 4, 5, 11 are pairwise coprime, so the product of whichever ones
+neither `a` nor `b` already covers is a valid single check) the third edge
+must satisfy. Wired into `generate_bricks_fast`'s inner loop as `c %
+required_mod != 0` → skip.
+
+**Bug caught by `check_prune.py` itself**: the first version used
+`tempfile.NamedTemporaryFile` to get a path, which pre-creates the file;
+`main.py`'s `log_result()` checks `os.path.exists()` to decide whether to
+write the CSV header, saw the (empty) file already there, and skipped the
+header — shifting every logged row up by one and silently losing the
+first real result from the comparison (`320` vs `319` bricks over
+`1-20,000`, not caught until diffing against a direct run). Fixed by
+`os.unlink()`-ing the path right after it's allocated. Recorded here
+because it's a reminder that the verification tooling needs verifying too.
+
+**Performance reality check**: the first implementation checked
+`any(c % m != 0 for m in required_mods)` per candidate — a generator
+expression, which in CPython costs more than the dict lookup it was meant
+to avoid. Net effect: **`--prune` was 18% *slower*** at `1-1,000,000`
+(63.8s vs 54.0s unpruned). Collapsing the check to the single combined
+modulus above got it back to roughly break-even (56.6s vs 58.6s, ~3%
+faster — within noise). Profiling showed why the win is small regardless:
+at `1-1,000,000`, `pythagorean_partners()` factoring is not the bottleneck
+(3.84s for the first 200,000 values, average divisor-partner-list length
+~19); the dominant cost is the sheer number of Python-level inner-loop
+iterations in the intersection step (~3.6×10^8 at `N=10^6`). Pruning
+correctly skips some of those iterations' dict lookups, but the fixed
+per-iteration Python loop/tuple-unpack overhead dominates regardless of
+what's skipped. That's a useful data point for Stage 3: it means the
+interpreter overhead itself, not this specific inefficiency, is the next
+real lever — reinforces that Stage 3 (compiled/vectorized inner loop)
+matters more than further pruning refinement at this scale.
 
 ## Stage 3 — Implementation speed
 
