@@ -22,7 +22,7 @@ testable against the known smallest Euler brick (44, 117, 240) as a sanity check
 - Good for roughly up to 10^6–10^7 on one core before pure-Python loop
   overhead dominates.
 
-## Stage 1 — Algorithmic rewrite (the important one)
+## Stage 1 — Algorithmic rewrite (the important one) — DONE
 
 Replace the O(n²)-ish nested scan with divisor-driven Pythagorean-triple
 generation:
@@ -38,6 +38,27 @@ generation:
 - This is the actual algorithmic gap between "brute force" and how real
   searches work — everything below is a speed multiplier on top of it, but
   this step is what makes larger bounds reachable at all.
+
+**Implemented** as `pythagorean_partners(a)` in `main.py` (trial-division
+factoring of `a`, doubled exponents to get divisors of `a²`, filtered to
+divisor pairs `s < a` with `s,t` same parity). `generate_bricks_fast` uses
+it: for each `a`, get partners in range; for each partner `b`, get `b`'s own
+partners and keep only the `c`s that also show up in `a`'s partner set (dict
+lookup instead of a full intersection merge). The old triple loop is kept as
+`generate_bricks_bruteforce` / `--brute-force`, used only to cross-check
+results on small ranges.
+
+Verified identical output against the brute-force method on `1-500`,
+`1-2000`, and `1-20000` (320 bricks, byte-identical CSV). Measured speedup
+at `1-20000`: brute-force 65.5s vs fast 0.47s (~140x), and the gap grows
+with range since brute-force is still ~O(n²) while the fast version scales
+with divisor counts. The fast version alone completed `1-1,000,000` in
+~75s (17,873 Euler bricks found, 0 perfect cuboids — expected) — a range
+brute-force was never going to reach in this session.
+
+Factoring is still plain trial division up to `sqrt(a)`, so it degrades on
+very large `a` (this is exactly what Stage 3's sieve/Pollard-rho swap is
+for) — Stage 1 fixes the *algorithm*, not yet the *factoring* implementation.
 
 ## Stage 2 — Known number-theoretic filters
 
